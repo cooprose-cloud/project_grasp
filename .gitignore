@@ -21,3 +21,11 @@ GRASP_System/special_images/
 GRASP_System/gedcoms/
 GRASP_System/styles/
 GRASP_System/assets/
+
+# ── Generated website output (rebuilt by generate_website.py) ────────────────
+# Copied media (~1.3 GB) and thumbnails — never to GitHub:
+website/images/
+website/thumbnails/
+# Generated HTML pages (regenerable; placeholders keep the folder structure):
+website/*.html
+website/**/*.html
