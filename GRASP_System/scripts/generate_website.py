@@ -14,6 +14,8 @@ import shutil
 import argparse
 import configparser
 import re
+import subprocess
+import tempfile
 
 # ============================================================================
 # NAME SORTING UTILITIES
@@ -665,6 +667,85 @@ def generate_thumbnail(source_path, thumb_path, size=(150, 150)):
         # Only print warning for actual failures on image files
         return False
 
+# ============================================================================
+# DOCUMENT -> PDF PREVIEW CONVERSION (LibreOffice)
+# ============================================================================
+# Word/RTF/ODT files can't render inline in a browser. If LibreOffice is
+# installed, we convert each one to a PDF alongside the original so the media
+# detail page can embed the PDF preview inline; the original file stays
+# downloadable. If LibreOffice is absent, docs simply remain download-only.
+
+DOC_PREVIEW_EXTS = {'.doc', '.docx', '.rtf', '.odt'}
+_SOFFICE_PATH = None
+_SOFFICE_CHECKED = False
+
+
+def find_soffice():
+    """Locate the LibreOffice 'soffice' binary, or return None if unavailable."""
+    global _SOFFICE_PATH, _SOFFICE_CHECKED
+    if _SOFFICE_CHECKED:
+        return _SOFFICE_PATH
+    _SOFFICE_CHECKED = True
+    candidates = [
+        shutil.which('soffice'),
+        shutil.which('libreoffice'),
+        '/Applications/LibreOffice.app/Contents/MacOS/soffice',
+        '/opt/homebrew/bin/soffice',
+        '/usr/local/bin/soffice',
+        '/usr/bin/soffice',
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            _SOFFICE_PATH = c
+            break
+    if _SOFFICE_PATH:
+        print(f"  LibreOffice found: {_SOFFICE_PATH}")
+        print("  Word/RTF/ODT documents will be converted to inline PDF previews.")
+    else:
+        print("  LibreOffice (soffice) not found - Word documents will remain download-only.")
+    return _SOFFICE_PATH
+
+
+def doc_preview_pdf_name(filename):
+    """Deterministic, collision-safe filename for a document's embedded PDF preview."""
+    return f"{filename}.preview.pdf"
+
+
+def convert_doc_to_pdf(source_file, dest_pdf):
+    """Convert a doc/docx/rtf/odt file to a PDF at dest_pdf via LibreOffice.
+    Returns True on success. Skips work if an up-to-date preview already exists."""
+    soffice = find_soffice()
+    if not soffice:
+        return False
+    source_file = Path(source_file)
+    dest_pdf = Path(dest_pdf)
+    try:
+        if dest_pdf.exists() and dest_pdf.stat().st_mtime >= source_file.stat().st_mtime:
+            return True  # existing preview is current
+    except OSError:
+        pass
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Isolated user profile so conversion works even if LibreOffice is open
+            profile = Path(tmpdir) / 'profile'
+            cmd = [
+                soffice,
+                f'-env:UserInstallation=file://{profile}',
+                '--headless', '--norestore', '--convert-to', 'pdf',
+                '--outdir', tmpdir, str(source_file),
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            produced = Path(tmpdir) / (source_file.stem + '.pdf')
+            if produced.exists():
+                shutil.move(str(produced), str(dest_pdf))
+                return True
+            print(f"  Warning: could not convert {source_file.name} to PDF: {result.stderr.strip()[:200]}")
+            return False
+    except Exception as e:
+        print(f"  Warning: PDF conversion error for {source_file.name}: {e}")
+        return False
+
+
 def process_media_files():
     """Process all media files: copy originals and generate thumbnails"""
     print("\nProcessing media files...")
@@ -688,6 +769,7 @@ def process_media_files():
     copied_count = 0
     thumbnail_count = 0
     icon_count = 0
+    doc_preview_count = 0
     missing_files = []
     
     # Document types that will get icons
@@ -738,7 +820,13 @@ def process_media_files():
                     actual_ext = Path(actual_source).suffix.lower().replace('.', '')
                     if actual_ext in document_types:
                         icon_count += 1
-                        
+
+                # Convert Word/RTF/ODT docs to an inline PDF preview (if LibreOffice available)
+                if Path(actual_source).suffix.lower() in DOC_PREVIEW_EXTS:
+                    preview_pdf = OUTPUT_DIR / 'images' / doc_preview_pdf_name(filename)
+                    if convert_doc_to_pdf(actual_source, preview_pdf):
+                        doc_preview_count += 1
+
             except Exception as e:
                 print(f"  Warning: Could not process {file_path}: {e}")
         else:
@@ -759,6 +847,8 @@ def process_media_files():
     
     print(f"  Copied {copied_count} media files")
     print(f"  Generated {thumbnail_count} thumbnails ({icon_count} document icons)")
+    if doc_preview_count:
+        print(f"  Converted {doc_preview_count} Word/RTF/ODT documents to inline PDF previews")
     
     # Summarize missing files at the end instead of individual warnings
     if missing_files:
@@ -1204,7 +1294,7 @@ def generate_individual_pages():
         html = get_html_header(name, 1)
         html += """
         <div>
-            <a href="index.html" class="return-to-index">← RETURN TO INDIVIDUALS INDEX</a>
+            <a href="index.html" class="return-to-index" onclick="if(window.history.length>1){history.back();return false;}">← RETURN TO PREVIOUS PAGE</a>
         </div>
 """
         html += f"""
@@ -1430,11 +1520,11 @@ def generate_individual_pages():
                                     title = media_item['title'] or filename
                                     doc_exts = {'.pdf', '.doc', '.docx', '.htm', '.html', '.txt', '.rtf'}
                                     is_doc = Path(filename).suffix.lower() in doc_exts
-                                    media_link = f"../media/media_{media_item['media_id']}.html" if is_doc else image_path
-                                    
+                                    media_link = f"../media/media_{media_item['media_id']}.html"
+
                                     sources_html += f'''
-                                        <a href="{media_link}" target="_blank" title="{title}">
-                                            <img src="{thumb_path}" alt="{title}" class="thumbnail" 
+                                        <a href="{media_link}" title="{title}">
+                                            <img src="{thumb_path}" alt="{title}" class="thumbnail"
                                                  style="max-width: 80px; max-height: 80px; margin-right: 8px; margin-bottom: 4px; vertical-align: middle; border: 1px solid #ccc;"
                                                  onerror="this.onerror=null; this.src='{image_path}'; this.style.maxWidth='80px'; this.style.maxHeight='80px';">
                                         </a>
@@ -1476,11 +1566,11 @@ def generate_individual_pages():
                             title = media_item['title'] or filename
                             doc_exts = {'.pdf', '.doc', '.docx', '.htm', '.html', '.txt', '.rtf'}
                             is_doc = Path(filename).suffix.lower() in doc_exts
-                            media_link = f"../media/media_{media_item['media_id']}.html" if is_doc else image_path
-                            
+                            media_link = f"../media/media_{media_item['media_id']}.html"
+
                             sources_html += f'''
-                                <a href="{media_link}" target="_blank" title="{title}">
-                                    <img src="{thumb_path}" alt="{title}" class="thumbnail" 
+                                <a href="{media_link}" title="{title}">
+                                    <img src="{thumb_path}" alt="{title}" class="thumbnail"
                                          style="max-width: 80px; max-height: 80px; margin-right: 8px; margin-bottom: 4px; vertical-align: middle; border: 1px solid #ccc;"
                                          onerror="this.onerror=null; this.src='{image_path}'; this.style.maxWidth='80px'; this.style.maxHeight='80px';">
                                 </a>
@@ -1518,8 +1608,8 @@ def generate_individual_pages():
                         title = m['title'] or filename
                         doc_exts = {'.pdf', '.doc', '.docx', '.htm', '.html', '.txt', '.rtf'}
                         is_doc = Path(filename).suffix.lower() in doc_exts
-                        media_link = f"../media/media_{m['media_id']}.html" if is_doc else image_path
-                        
+                        media_link = f"../media/media_{m['media_id']}.html"
+
                         html += f"""
             <a href="{media_link}">
                 <img src="{thumb_path}" alt="{title}" class="thumbnail" onerror="this.src='{image_path}'">
@@ -1887,24 +1977,24 @@ def generate_family_pages():
         html = get_html_header(f'Family {family_id}', 1)
         html += """
         <div>
-            <a href="index.html" class="return-to-index">← RETURN TO FAMILIES INDEX</a>
+            <a href="index.html" class="return-to-index" onclick="if(window.history.length>1){history.back();return false;}">← RETURN TO PREVIOUS PAGE</a>
         </div>
 """
         html += f"""
         <h2>Family {family_id}: {husband_name} &amp; {wife_name}</h2>
         <p style="margin-top:-8px; font-size:0.85em;"><a href="index.html#{family_id}" class="return-to-index">Index by husband</a> &nbsp;|&nbsp; <a href="index_by_wife.html#{family_id}" class="return-to-index">Index by wife</a></p>
         
-        <div class="family-tree">
+        <button class="fs-btn" onclick="openTreeFullscreen()">⛶ View chart full screen</button>
+        <div class="family-tree" id="family-tree">
+        <button class="fs-btn fs-close" onclick="closeTreeFullscreen()">✕ Close full screen</button>
 """
         
         # Grandparents row (if any exist)
         has_grandparents = husband_father or husband_mother or wife_father or wife_mother
         if has_grandparents:
-            html += '<div class="tree-row" style="justify-content: space-around; align-items: flex-start;">'
+            html += '<div class="tree-row" style="justify-content: space-around; align-items: flex-start; flex-wrap: wrap; gap: 24px;">'
 
-            # --- Husband's parents (left side) ---
-            html += '<div style="display: flex; flex-direction: column; gap: 6px; align-items: center;">'
-            html += '<div style="font-size:1.1em; font-weight:bold; color:#0F3460; margin-bottom:4px;">Husband\'s Parents</div>'
+            # --- Husband's parents: father and mother side by side ---
             if husband_father and husband_father['father_id']:
                 parts = [husband_father['father_given'] or '', husband_father['father_surname'] or '']
                 if husband_father.get('father_suffix'):
@@ -1915,11 +2005,9 @@ def generate_family_pages():
                     dates += f"<br><small>b. {husband_father['father_birth']}</small>"
                 if husband_father.get('father_death'):
                     dates += f"<br><small>d. {husband_father['father_death']}</small>"
-                html += f'<div class="person-box male"><a href="../individuals/individual_{husband_father["father_id"]}.html">{name}</a>{dates}{primary_family_badge(get_primary_family_id(cursor, husband_father["father_id"]), individual_id=husband_father["father_id"])}</div>'
+                hf_box = f'<div class="person-box male"><a href="../individuals/individual_{husband_father["father_id"]}.html">{name}</a>{dates}{primary_family_badge(get_primary_family_id(cursor, husband_father["father_id"]), individual_id=husband_father["father_id"])}</div>'
             else:
-                html += '<div class="person-box male" style="min-width:160px; text-align:center;"><span style="font-style:italic;opacity:0.7;color:white;">Unknown</span></div>'
-            if husband_parents_marriage:
-                html += f'<div style="font-size:1.0em; font-weight:bold; color:#2E8B57;">m. {husband_parents_marriage}</div>'
+                hf_box = '<div class="person-box male" style="min-width:160px; text-align:center;"><span style="font-style:italic;opacity:0.7;color:#F5F1E8;">Unknown</span></div>'
             if husband_mother and husband_mother['mother_id']:
                 parts = [husband_mother['mother_given'] or '', husband_mother['mother_surname'] or '']
                 if husband_mother.get('mother_suffix'):
@@ -1930,14 +2018,19 @@ def generate_family_pages():
                     dates += f"<br><small>b. {husband_mother['mother_birth']}</small>"
                 if husband_mother.get('mother_death'):
                     dates += f"<br><small>d. {husband_mother['mother_death']}</small>"
-                html += f'<div class="person-box female"><a href="../individuals/individual_{husband_mother["mother_id"]}.html">{name}</a>{dates}{primary_family_badge(get_primary_family_id(cursor, husband_mother["mother_id"]), individual_id=husband_mother["mother_id"])}</div>'
+                hm_box = f'<div class="person-box female"><a href="../individuals/individual_{husband_mother["mother_id"]}.html">{name}</a>{dates}{primary_family_badge(get_primary_family_id(cursor, husband_mother["mother_id"]), individual_id=husband_mother["mother_id"])}</div>'
             else:
-                html += '<div class="person-box female" style="min-width:160px; text-align:center;"><span style="font-style:italic;opacity:0.7;color:white;">Unknown</span></div>'
+                hm_box = '<div class="person-box female" style="min-width:160px; text-align:center;"><span style="font-style:italic;opacity:0.7;color:#F5F1E8;">Unknown</span></div>'
+            if husband_parents_marriage:
+                h_conn = f'<div style="color:#2E8B57; font-weight:bold; font-size:0.85em; padding:0 6px; white-space:nowrap;">m. {husband_parents_marriage}</div>'
+            else:
+                h_conn = '<div style="color:#2E8B57; font-weight:bold; font-size:1.1em; padding:0 6px;">═══</div>'
+            html += '<div style="display: flex; flex-direction: column; gap: 6px; align-items: center;">'
+            html += '<div style="font-size:1.1em; font-weight:bold; color:#0F3460; margin-bottom:4px;">Husband\'s Parents</div>'
+            html += f'<div style="display: flex; gap: 8px; align-items: center; justify-content: center;">{hf_box}{h_conn}{hm_box}</div>'
             html += '</div>'
 
-            # --- Wife's parents (right side) ---
-            html += '<div style="display: flex; flex-direction: column; gap: 6px; align-items: center;">'
-            html += '<div style="font-size:1.1em; font-weight:bold; color:#0F3460; margin-bottom:4px;">Wife\'s Parents</div>'
+            # --- Wife's parents: father and mother side by side ---
             if wife_father and wife_father['father_id']:
                 parts = [wife_father['father_given'] or '', wife_father['father_surname'] or '']
                 if wife_father.get('father_suffix'):
@@ -1948,11 +2041,9 @@ def generate_family_pages():
                     dates += f"<br><small>b. {wife_father['father_birth']}</small>"
                 if wife_father.get('father_death'):
                     dates += f"<br><small>d. {wife_father['father_death']}</small>"
-                html += f'<div class="person-box male"><a href="../individuals/individual_{wife_father["father_id"]}.html">{name}</a>{dates}{primary_family_badge(get_primary_family_id(cursor, wife_father["father_id"]), individual_id=wife_father["father_id"])}</div>'
+                wf_box = f'<div class="person-box male"><a href="../individuals/individual_{wife_father["father_id"]}.html">{name}</a>{dates}{primary_family_badge(get_primary_family_id(cursor, wife_father["father_id"]), individual_id=wife_father["father_id"])}</div>'
             else:
-                html += '<div class="person-box male" style="min-width:160px; text-align:center;"><span style="font-style:italic;opacity:0.7;color:white;">Unknown</span></div>'
-            if wife_parents_marriage:
-                html += f'<div style="font-size:1.0em; font-weight:bold; color:#2E8B57;">m. {wife_parents_marriage}</div>'
+                wf_box = '<div class="person-box male" style="min-width:160px; text-align:center;"><span style="font-style:italic;opacity:0.7;color:#F5F1E8;">Unknown</span></div>'
             if wife_mother and wife_mother['mother_id']:
                 parts = [wife_mother['mother_given'] or '', wife_mother['mother_surname'] or '']
                 if wife_mother.get('mother_suffix'):
@@ -1963,9 +2054,16 @@ def generate_family_pages():
                     dates += f"<br><small>b. {wife_mother['mother_birth']}</small>"
                 if wife_mother.get('mother_death'):
                     dates += f"<br><small>d. {wife_mother['mother_death']}</small>"
-                html += f'<div class="person-box female"><a href="../individuals/individual_{wife_mother["mother_id"]}.html">{name}</a>{dates}{primary_family_badge(get_primary_family_id(cursor, wife_mother["mother_id"]), individual_id=wife_mother["mother_id"])}</div>'
+                wm_box = f'<div class="person-box female"><a href="../individuals/individual_{wife_mother["mother_id"]}.html">{name}</a>{dates}{primary_family_badge(get_primary_family_id(cursor, wife_mother["mother_id"]), individual_id=wife_mother["mother_id"])}</div>'
             else:
-                html += '<div class="person-box female" style="min-width:160px; text-align:center;"><span style="font-style:italic;opacity:0.7;color:white;">Unknown</span></div>'
+                wm_box = '<div class="person-box female" style="min-width:160px; text-align:center;"><span style="font-style:italic;opacity:0.7;color:#F5F1E8;">Unknown</span></div>'
+            if wife_parents_marriage:
+                w_conn = f'<div style="color:#2E8B57; font-weight:bold; font-size:0.85em; padding:0 6px; white-space:nowrap;">m. {wife_parents_marriage}</div>'
+            else:
+                w_conn = '<div style="color:#2E8B57; font-weight:bold; font-size:1.1em; padding:0 6px;">═══</div>'
+            html += '<div style="display: flex; flex-direction: column; gap: 6px; align-items: center;">'
+            html += '<div style="font-size:1.1em; font-weight:bold; color:#0F3460; margin-bottom:4px;">Wife\'s Parents</div>'
+            html += f'<div style="display: flex; gap: 8px; align-items: center; justify-content: center;">{wf_box}{w_conn}{wm_box}</div>'
             html += '</div>'
 
             html += '</div>'  # end tree-row
@@ -1990,7 +2088,7 @@ def generate_family_pages():
                 dates += f"<br><small>d. {husband_death}</small>"
             html += f'<div class="person-box central-couple male"><a href="../individuals/individual_{husband_id}.html">{husband_name}</a>{dates}</div>'
         else:
-            html += f'<div class="person-box central-couple male"><span style="font-style:italic;opacity:0.7;color:white;">Unknown</span></div>'
+            html += f'<div class="person-box central-couple male"><span style="font-style:italic;opacity:0.7;color:#F5F1E8;">Unknown</span></div>'
         
         html += f'<div style="color: #2E8B57; font-weight: bold; font-size: 1.2em; padding: 0 10px;">═══</div>'
         
@@ -2002,7 +2100,7 @@ def generate_family_pages():
                 dates += f"<br><small>d. {wife_death}</small>"
             html += f'<div class="person-box central-couple female"><a href="../individuals/individual_{wife_id}.html">{wife_name}</a>{dates}</div>'
         else:
-            html += f'<div class="person-box central-couple female"><span style="font-style:italic;opacity:0.7;color:white;">Unknown</span></div>'
+            html += f'<div class="person-box central-couple female"><span style="font-style:italic;opacity:0.7;color:#F5F1E8;">Unknown</span></div>'
         
         html += """
                 </div>
@@ -2012,11 +2110,12 @@ def generate_family_pages():
         if marriage_date:
             html += f'<div style="text-align: center; color: #2E8B57; font-size:1.1em; font-weight:bold; margin: 4px 0;">Married: {marriage_date}</div>'
         
-        # Children row
+        # Children row (sorted chronologically by birth date, stacked in a column)
         if children:
+            children = sorted(children, key=lambda c: parse_gedcom_date(c.get('birth_date')))
             html += """
             <div style="text-align: center; margin: 10px 0; color: #5C4033; font-size: 2.5em;">↓</div>
-            <div class="tree-row" style="flex-wrap: wrap;">
+            <div class="tree-row" style="flex-direction: column; align-items: center; gap: 8px;">
 """
             for child in children:
                 parts = [child['given_name'] or '', child['surname'] or '']
@@ -2038,8 +2137,13 @@ def generate_family_pages():
         
         html += """
         </div>
+        <script>
+        function openTreeFullscreen(){var el=document.getElementById('family-tree');if(el.requestFullscreen){el.requestFullscreen().catch(function(){el.classList.add('pseudo-fullscreen');});}else if(el.webkitRequestFullscreen){el.webkitRequestFullscreen();}else{el.classList.add('pseudo-fullscreen');}}
+        function closeTreeFullscreen(){var el=document.getElementById('family-tree');if(document.fullscreenElement){document.exitFullscreen();}else if(document.webkitFullscreenElement){document.webkitExitFullscreen();}el.classList.remove('pseudo-fullscreen');}
+        document.addEventListener('keydown',function(e){if(e.key==='Escape'){document.getElementById('family-tree').classList.remove('pseudo-fullscreen');}});
+        </script>
 """
-        
+
         # Get and display family events (marriages, divorces, etc.)
         cursor.execute("""
             SELECT e.event_id, e.event_type, e.event_date, e.event_place
@@ -2392,11 +2496,11 @@ def generate_event_pages():
                             title = media_item['title'] or filename
                             doc_exts = {'.pdf', '.doc', '.docx', '.htm', '.html', '.txt', '.rtf'}
                             is_doc = Path(filename).suffix.lower() in doc_exts
-                            media_link = f"../media/media_{media_item['media_id']}.html" if is_doc else image_path
-                            
+                            media_link = f"../media/media_{media_item['media_id']}.html"
+
                             html += f'''
-            <a href="{media_link}" target="_blank" title="{title}">
-                <img src="{thumb_path}" alt="{title}" class="thumbnail" 
+            <a href="{media_link}" title="{title}">
+                <img src="{thumb_path}" alt="{title}" class="thumbnail"
                      style="max-width: 80px; max-height: 80px; margin-right: 8px; margin-bottom: 4px; vertical-align: middle; border: 1px solid #ccc;"
                      onerror="this.onerror=null; this.src='{image_path}'; this.style.maxWidth='80px'; this.style.maxHeight='80px';">
             </a>
@@ -2425,11 +2529,11 @@ def generate_event_pages():
                     title = m['title'] or filename
                     doc_exts = {'.pdf', '.doc', '.docx', '.htm', '.html', '.txt', '.rtf'}
                     is_doc = Path(filename).suffix.lower() in doc_exts
-                    media_link = f"../media/media_{m['media_id']}.html" if is_doc else image_path
-                    
+                    media_link = f"../media/media_{m['media_id']}.html"
+
                     html += f'''
-            <a href="{media_link}" target="_blank" title="{title}">
-                <img src="{thumb_path}" alt="{title}" class="thumbnail" 
+            <a href="{media_link}" title="{title}">
+                <img src="{thumb_path}" alt="{title}" class="thumbnail"
                      style="max-width: 150px; max-height: 150px; margin: 10px; border: 2px solid #D4AF37;"
                      onerror="this.onerror=null; this.src='{image_path}'; this.style.maxWidth='150px'; this.style.maxHeight='150px';">
             </a>
@@ -2913,7 +3017,7 @@ def generate_place_pages():
         html = get_html_header(place_name, 1)
         html += """
         <div>
-            <a href="index.html" class="return-to-index">← RETURN TO PLACES INDEX</a>
+            <a href="index.html" class="return-to-index" onclick="if(window.history.length>1){history.back();return false;}">← RETURN TO PREVIOUS PAGE</a>
         </div>
 """
         html += f"""
@@ -3316,7 +3420,7 @@ def _generate_source_page(source, individual_events, family_events, citation_med
     html = get_html_header(f"Source: {title}", 1)
     html += """
         <div>
-            <a href="index.html" class="return-to-index">← RETURN TO SOURCES INDEX</a>
+            <a href="index.html" class="return-to-index" onclick="if(window.history.length>1){history.back();return false;}">← RETURN TO PREVIOUS PAGE</a>
         </div>
 """
     html += f"""
@@ -3712,6 +3816,9 @@ def generate_media_pages():
         
         html = get_html_header(title, 1)
         html += """
+        <div>
+            <a href="index.html" class="return-to-index" onclick="if(window.history.length>1){history.back();return false;}">← RETURN TO PREVIOUS PAGE</a>
+        </div>
 """
         html += f"""
         <h2>{title}</h2>
@@ -3738,8 +3845,37 @@ def generate_media_pages():
                 thumb_path = f"../thumbnails/{Path(filename).stem}_thumb.jpg"
                 # Check if the actual file exists
                 actual_file = OUTPUT_DIR / 'images' / filename
+                preview_pdf_file = OUTPUT_DIR / 'images' / doc_preview_pdf_name(filename)
                 if actual_file.exists():
-                    html += f"""
+                    if file_ext == '.pdf':
+                        # PDFs embed inline so they display on the framed page (with the return button)
+                        html += f"""
+        <div style="margin: 20px 0;">
+            <object data="{image_path}" type="application/pdf" width="100%" height="800" style="border: 3px solid #FFD700; border-radius: 5px;">
+                <iframe src="{image_path}" width="100%" height="800" style="border: none;">
+                    <p>Your browser can't display this PDF inline.</p>
+                </iframe>
+            </object>
+            <p style="text-align: center; margin-top: 15px;"><a href="{image_path}" target="_blank" style="font-size: 1.2em; font-weight: bold;">📥 Open / Download PDF File</a></p>
+            <p style="text-align: center; font-size: 0.9em; color: #666;">{filename}</p>
+        </div>
+"""
+                    elif file_ext in DOC_PREVIEW_EXTS and preview_pdf_file.exists():
+                        # Word/RTF/ODT: embed the converted PDF preview inline; original stays downloadable
+                        preview_src = f"../images/{doc_preview_pdf_name(filename)}"
+                        html += f"""
+        <div style="margin: 20px 0;">
+            <object data="{preview_src}" type="application/pdf" width="100%" height="800" style="border: 3px solid #FFD700; border-radius: 5px;">
+                <iframe src="{preview_src}" width="100%" height="800" style="border: none;">
+                    <p>Your browser can't display this preview inline.</p>
+                </iframe>
+            </object>
+            <p style="text-align: center; margin-top: 15px;"><a href="{image_path}" target="_blank" style="font-size: 1.2em; font-weight: bold;">📥 Download original {file_ext.upper().replace(".","")} File</a></p>
+            <p style="text-align: center; font-size: 0.9em; color: #666;">{filename}</p>
+        </div>
+"""
+                    else:
+                        html += f"""
         <div style="text-align: center; margin: 20px 0;">
             <div style="display: inline-block; padding: 30px; border: 2px solid var(--navy-medium, #16213E); border-radius: 8px; background-color: #f8f9fa;">
                 <img src="{thumb_path}" alt="{title}" style="max-width: 200px; max-height: 200px; border: 3px solid #FFD700; border-radius: 3px;"
@@ -4489,7 +4625,7 @@ def _query_report_header(title, description, slug, depth=2):
     html  = get_html_header(title, depth)
     html += f"""
         <div style="display:flex; align-items:center; gap:10px; margin-bottom:16px; flex-wrap:wrap;">
-            <a href="../queries.html" class="return-to-index">← RETURN TO QUERIES</a>
+            <a href="../queries.html" class="return-to-index" onclick="if(window.history.length>1){{history.back();return false;}}">← RETURN TO PREVIOUS PAGE</a>
             <a href="{slug}_print.html" target="_blank" class="return-to-index"
                style="background-color:var(--navy-medium);">🖨 Print Report</a>
         </div>
