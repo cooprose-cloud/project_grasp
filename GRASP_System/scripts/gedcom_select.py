@@ -34,6 +34,7 @@ import os
 import sys
 import threading
 import webbrowser
+from collections import defaultdict
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # Reuse the parsing + pruning engine from the pruner (same folder)
@@ -79,6 +80,60 @@ def build_individuals(gedcom_path):
 
     people.sort(key=sort_key)
     return people
+
+
+def build_relationships(gedcom_path):
+    """Return (parents, children) maps: id -> list of parent/child ids."""
+    lines = read_gedcom_lines(gedcom_path)
+    recs = index_records(lines)
+    fam = {}
+    for xref, rec in recs.items():
+        if rec["type"] != "FAM":
+            continue
+        h = w = None
+        ch = []
+        for idx in sorted(rec["block"]):
+            lv, tag, rest, _ = lines[idx]
+            if lv == 1 and tag == "HUSB" and is_pointer(rest):
+                h = rest
+            elif lv == 1 and tag == "WIFE" and is_pointer(rest):
+                w = rest
+            elif lv == 1 and tag == "CHIL" and is_pointer(rest):
+                ch.append(rest)
+        fam[xref] = (h, w, ch)
+
+    parents = defaultdict(set)
+    children = defaultdict(set)
+    for xref, rec in recs.items():
+        if rec["type"] != "INDI":
+            continue
+        for idx in sorted(rec["block"]):
+            lv, tag, rest, _ = lines[idx]
+            if lv == 1 and tag == "FAMC" and is_pointer(rest) and rest in fam:
+                h, w, _ch = fam[rest]
+                for p in (h, w):
+                    if p:
+                        parents[xref].add(p)
+            elif lv == 1 and tag == "FAMS" and is_pointer(rest) and rest in fam:
+                _h, _w, ch = fam[rest]
+                for c in ch:
+                    children[xref].add(c)
+    return ({k: list(v) for k, v in parents.items()},
+            {k: list(v) for k, v in children.items()})
+
+
+def _closure(seeds, adj):
+    """All ids reachable from seeds following adjacency map adj (excludes seeds)."""
+    seeds = set(seeds)
+    seen = set()
+    stack = list(seeds)
+    while stack:
+        x = stack.pop()
+        for y in adj.get(x, ()):
+            if y not in seen and y not in seeds:
+                seen.add(y)
+                stack.append(y)
+    return seen
 
 
 def load_existing_ids(ids_path):
@@ -150,6 +205,8 @@ PAGE = """<!DOCTYPE html>
   <div class="bar">
     <input id="q" placeholder="Search by name or ID…" autocomplete="off">
     <button class="ghost" id="selshown">Select all shown</button>
+    <button class="ghost" id="anc">+ Ancestors of selected</button>
+    <button class="ghost" id="desc">+ Descendants of selected</button>
     <button class="ghost" id="invert">Invert selection</button>
     <button class="ghost" id="clear">Clear all</button>
     <span class="count"><span id="n">0</span> selected</span>
@@ -218,6 +275,21 @@ document.querySelectorAll('th[data-k]').forEach(th=>{
   th.onclick=()=>{const k=th.dataset.k; if(sortK===k)sortDir*=-1; else{sortK=k;sortDir=1;} render();};
 });
 document.getElementById('selshown').onclick=()=>{shown().forEach(p=>selected.add(p.id));render();};
+async function expand(mode){
+  if(selected.size===0){ banner(false,'Select at least one person first — the root of the branch to keep.'); return; }
+  setBusy(true);
+  try{
+    const r=await fetch('/expand',{method:'POST',headers:{'Content-Type':'application/json'},
+                                  body:JSON.stringify({ids:[...selected],mode})});
+    const j=await r.json();
+    if(!j.ok){ banner(false,'Error: '+(j.error||'expand failed')); return; }
+    selected.clear(); j.ids.forEach(id=>selected.add(id)); render();
+    banner(true, `Added ${j.added} ${mode}. ${selected.size} people now selected (the branch to keep). `+
+                 `Next: click <b>Invert selection</b> so everyone else becomes the removal list, then Save &amp; Prune.`);
+  }finally{ setBusy(false); }
+}
+document.getElementById('anc').onclick=()=>expand('ancestors');
+document.getElementById('desc').onclick=()=>expand('descendants');
 document.getElementById('invert').onclick=()=>{
   const next=new Set();
   for(const p of PEOPLE){ if(!selected.has(p.id)) next.add(p.id); }
@@ -349,6 +421,18 @@ def make_handler(cfg):
                                 "ids_path": os.path.abspath(cfg["ids_path"]),
                                 "report": report})
 
+                elif self.path == "/expand":
+                    length = int(self.headers.get("Content-Length", 0))
+                    payload = json.loads(self.rfile.read(length) or b"{}")
+                    seeds = list(payload.get("ids", []))
+                    mode = payload.get("mode", "")
+                    adj = cfg["parents"] if mode == "ancestors" else cfg["children"]
+                    rel = _closure(seeds, adj)
+                    allids = sorted(set(seeds) | rel,
+                                    key=lambda x: order.get(x, 1e9))
+                    self._json({"ok": True, "ids": allids,
+                                "added": len(rel - set(seeds))})
+
                 elif self.path == "/cancel":
                     self._json({"ok": True})
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -385,9 +469,12 @@ def main():
     require_distinct(args.gedcom, args.output)
 
     people = build_individuals(args.gedcom)
+    parents, children = build_relationships(args.gedcom)
     cfg = {
         "people": people,
         "name_map": {p["id"]: p["name"] for p in people},
+        "parents": parents,
+        "children": children,
         "ids_path": args.ids,
         "gedcom": args.gedcom,
         "output": args.output,
