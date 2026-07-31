@@ -149,30 +149,69 @@ def media_label(lines, rec):
 # Removal engine
 # --------------------------------------------------------------------------
 
-def load_remove_ids(path):
-    """Read ids from a text/CSV file; normalize 'I327' -> '@I327@'."""
-    ids = []
-    with open(path, encoding="utf-8-sig", errors="replace") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            token = line.replace(",", " ").split()[0]   # first field (space or comma separated); rest is a note
+def classify_tokens(tokens):
+    """Split a list of removal tokens into (record_ids, event_tags, even_types).
+
+    Tokens may be:
+      * a record id:  @I327@ / I327 / @S45@ / @M1006@
+      * an event tag: 'EVENT RESI' or 'EVENT:RESI'   -> strip all RESI events
+      * an EVEN type: 'EVENTTYPE Arrival' or 'EVENTTYPE:Arrival'
+                                                      -> strip EVEN whose TYPE matches
+    """
+    record_ids = []
+    event_tags = set()
+    even_types = set()
+    for raw in tokens:
+        s = str(raw).strip()
+        if not s:
+            continue
+        up = s.upper()
+        if up.startswith("EVENTTYPE"):
+            val = s[len("EVENTTYPE"):].lstrip(": ").strip()
+            if val:
+                even_types.add(val)
+        elif up.startswith("EVENT:") or up.startswith("EVENT "):
+            rest = s[len("EVENT"):].lstrip(": ").strip()
+            tag = rest.split()[0].upper() if rest else ""
+            if tag:
+                event_tags.add(tag)
+        else:
+            token = s.replace(",", " ").split()[0]   # first field; rest is a note
             if not token:
                 continue
             if not token.startswith("@"):
                 token = "@" + token
             if not token.endswith("@"):
                 token = token + "@"
-            ids.append(token)
-    # de-dup, preserve order
+            record_ids.append(token)
     seen = set()
     out = []
-    for i in ids:
+    for i in record_ids:
         if i not in seen:
             seen.add(i)
             out.append(i)
-    return out
+    return out, event_tags, even_types
+
+
+def load_remove_ids(path):
+    """Read removal tokens from a file -> (record_ids, event_tags, even_types)."""
+    tokens = []
+    with open(path, encoding="utf-8-sig", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            tokens.append(line)
+    return classify_tokens(tokens)
+
+
+def even_type_value(lines, even_idx):
+    """Return the TYPE value under a '1 EVEN' block, or None."""
+    for k in get_block_lines(lines, even_idx):
+        lv, tag, rest, _ = lines[k]
+        if lv == 2 and tag == "TYPE":
+            return rest
+    return None
 
 
 def referenced_xrefs(lines, alive):
@@ -191,53 +230,72 @@ def kill_line_and_subblock(lines, alive, idx):
         alive[k] = False
 
 
-def prune(lines, remove_ids, prune_sources=True, prune_media=True):
+def prune(lines, remove_ids, prune_sources=True, prune_media=True,
+          remove_event_tags=None, remove_even_types=None):
     """Return (alive[], stats dict). Does not write anything."""
     n = len(lines)
     alive = [True] * n
     records = index_records(lines)
+    remove_event_tags = {t.upper() for t in (remove_event_tags or set())}
+    remove_even_types = set(remove_even_types or set())
 
     stats = {
         "removed_individuals": [],   # (id, name)
+        "removed_sources": [],       # (id, label) explicitly selected
+        "removed_media": [],         # (id, label) explicitly selected
         "missing_ids": [],           # ids not found
-        "wrong_type_ids": [],        # ids found but not INDI
+        "wrong_type_ids": [],        # ids found but not INDI/SOUR/OBJE
         "families_deleted": [],      # (id)
         "families_modified": set(),  # ids that lost a member but survived
         "sources_pruned": [],        # (id, label)
         "media_pruned": [],          # (id, label)
+        "events_removed": 0,         # event sub-blocks stripped
+        "events_by_kind": {},        # tag or EVEN:type -> count
         "dangling_refs_removed": 0,  # pointer lines removed referencing gone recs
     }
 
-    # --- 1. Resolve the removal set to real INDI records -------------------
-    remove_indi = set()
+    # --- 1. Resolve the removal set to INDI / SOUR / OBJE records ----------
+    remove_indi = set()      # individuals (drive family cleanup)
+    remove_rec = set()       # every record to delete (indi + sour + obje)
     for rid in remove_ids:
         rec = records.get(rid)
         if rec is None:
             stats["missing_ids"].append(rid)
-        elif rec["type"] != "INDI":
-            stats["wrong_type_ids"].append((rid, rec["type"]))
-        else:
+            continue
+        t = rec["type"]
+        if t == "INDI":
             remove_indi.add(rid)
+            remove_rec.add(rid)
             stats["removed_individuals"].append((rid, person_name(lines, rec)))
+        elif t == "SOUR":
+            remove_rec.add(rid)
+            stats["removed_sources"].append((rid, source_label(lines, rec)))
+        elif t == "OBJE":
+            remove_rec.add(rid)
+            stats["removed_media"].append((rid, media_label(lines, rec)))
+        else:
+            stats["wrong_type_ids"].append((rid, t))
 
-    # Kill the selected individual records outright
-    for rid in remove_indi:
+    # Kill the selected records outright
+    for rid in remove_rec:
         for k in records[rid]["block"]:
             alive[k] = False
 
-    # --- 2. Remove any surviving pointer line that references a removed INDI
-    #        (detaches from families: HUSB/WIFE/CHIL, plus ASSO, etc.) -------
+    # --- 2. Strip any surviving pointer line that references a removed record
+    #        (detaches families HUSB/WIFE/CHIL/ASSO, source citations, and
+    #         media links) ----------------------------------------------------
     for idx in range(n):
         if not alive[idx]:
             continue
         level, tag, rest, _ = lines[idx]
-        if level is not None and level >= 1 and is_pointer(rest) and rest in remove_indi:
+        if level is not None and level >= 1 and is_pointer(rest) and rest in remove_rec:
             kill_line_and_subblock(lines, alive, idx)
             stats["dangling_refs_removed"] += 1
-            # note which family lost a member (for the report)
-            owner = _owning_record(lines, idx)
-            if owner and records.get(owner, {}).get("type") == "FAM":
-                stats["families_modified"].add(owner)
+            # note which family lost a member (only for individual removals)
+            if rest in remove_indi:
+                owner = _owning_record(lines, idx)
+                if owner and records.get(owner, {}).get("type") == "FAM":
+                    stats["families_modified"].add(owner)
 
     # --- 3. Delete families with nobody left; cascade FAMC/FAMS cleanup -----
     removed_fam = set()
@@ -270,6 +328,31 @@ def prune(lines, remove_ids, prune_sources=True, prune_media=True):
             level, tag, rest, _ = lines[idx]
             if level is not None and level >= 1 and is_pointer(rest) and rest in removed_fam:
                 kill_line_and_subblock(lines, alive, idx)
+
+    # --- 3b. Strip selected event types from surviving INDI / FAM records --
+    if remove_event_tags or remove_even_types:
+        by_kind = {}
+        for xref, rec in records.items():
+            if rec["type"] not in ("INDI", "FAM"):
+                continue
+            for idx in sorted(rec["block"]):
+                if not alive[idx]:
+                    continue
+                level, tag, rest, _ = lines[idx]
+                if level != 1:
+                    continue
+                kind = None
+                if tag in remove_event_tags:
+                    kind = tag
+                elif tag == "EVEN" and remove_even_types:
+                    tv = even_type_value(lines, idx)
+                    if tv in remove_even_types:
+                        kind = f"EVEN:{tv}"
+                if kind:
+                    kill_line_and_subblock(lines, alive, idx)
+                    stats["events_removed"] += 1
+                    by_kind[kind] = by_kind.get(kind, 0) + 1
+        stats["events_by_kind"] = by_kind
 
     # --- 4. Prune orphaned SOUR / OBJE, iterating to convergence -----------
     if prune_sources or prune_media:
@@ -335,7 +418,7 @@ def print_report(stats, dry_run):
         for rid in stats["missing_ids"]:
             print(f"       {rid}")
     if stats["wrong_type_ids"]:
-        print(f"\n  !! {len(stats['wrong_type_ids'])} id(s) are not individuals (skipped):")
+        print(f"\n  !! {len(stats['wrong_type_ids'])} id(s) are not removable (skipped):")
         for rid, typ in stats["wrong_type_ids"]:
             print(f"       {rid} is a {typ}")
 
@@ -343,10 +426,24 @@ def print_report(stats, dry_run):
     for rid, name in stats["removed_individuals"]:
         print(f"       {rid}  {name}")
 
+    if stats["removed_sources"]:
+        print(f"\n  Sources removed (selected): {len(stats['removed_sources'])}")
+        for rid, label in stats["removed_sources"]:
+            print(f"       {rid}  {label}")
+    if stats["removed_media"]:
+        print(f"\n  Media removed (selected): {len(stats['removed_media'])}")
+        for rid, label in stats["removed_media"]:
+            print(f"       {rid}  {label}")
+
     print(f"\n  Families deleted (emptied): {len(stats['families_deleted'])}")
     for xref in stats["families_deleted"]:
         print(f"       {xref}")
     print(f"  Families kept but detached from a removed member: {len(stats['families_modified'])}")
+
+    if stats["events_removed"]:
+        print(f"\n  Events removed: {stats['events_removed']}")
+        for kind, cnt in sorted(stats["events_by_kind"].items()):
+            print(f"       {kind}: {cnt}")
 
     print(f"\n  Sources pruned (orphaned): {len(stats['sources_pruned'])}")
     print(f"  Media pruned (orphaned):   {len(stats['media_pruned'])}")
@@ -360,6 +457,10 @@ def write_csv_report(stats, path):
         w.writerow(["action", "type", "id", "detail"])
         for rid, name in stats["removed_individuals"]:
             w.writerow(["removed", "INDI", rid, name])
+        for rid, label in stats["removed_sources"]:
+            w.writerow(["removed", "SOUR", rid, label])
+        for rid, label in stats["removed_media"]:
+            w.writerow(["removed", "OBJE", rid, label])
         for xref in stats["families_deleted"]:
             w.writerow(["deleted", "FAM", xref, "emptied"])
         for xref in sorted(stats["families_modified"]):
@@ -368,10 +469,12 @@ def write_csv_report(stats, path):
             w.writerow(["pruned", "SOUR", xref, label])
         for xref, label in stats["media_pruned"]:
             w.writerow(["pruned", "OBJE", xref, label])
+        for kind, cnt in sorted(stats.get("events_by_kind", {}).items()):
+            w.writerow(["removed", "EVENT", kind, f"{cnt} stripped"])
         for rid in stats["missing_ids"]:
             w.writerow(["skipped", "?", rid, "id not found"])
         for rid, typ in stats["wrong_type_ids"]:
-            w.writerow(["skipped", typ, rid, "not an individual"])
+            w.writerow(["skipped", typ, rid, "not removable (INDI/SOUR/OBJE only)"])
 
 
 # --------------------------------------------------------------------------
@@ -384,8 +487,11 @@ def main():
                     "their supporting records.")
     ap.add_argument("input", help="input GEDCOM file")
     ap.add_argument("--remove", required=True,
-                    help="file listing individual ids to remove (one per line)")
+                    help="file listing ids to remove (individuals/sources/media), "
+                         "and/or event lines like 'EVENT RESI' or 'EVENTTYPE Arrival'")
     ap.add_argument("--output", required=True, help="output GEDCOM file")
+    ap.add_argument("--remove-events", default="",
+                    help="comma-separated event tags to strip, e.g. RESI,BAPM")
     ap.add_argument("--keep-orphans", action="store_true",
                     help="keep ALL sources and media even if unreferenced")
     ap.add_argument("--keep-orphan-sources", action="store_true",
@@ -402,12 +508,15 @@ def main():
     prune_media = not args.keep_orphans
 
     lines = read_gedcom_lines(args.input)
-    remove_ids = load_remove_ids(args.remove)
-    if not remove_ids:
-        sys.exit("ERROR: no ids found in --remove file.")
+    remove_ids, event_tags, even_types = load_remove_ids(args.remove)
+    if args.remove_events:
+        event_tags |= {t.strip().upper() for t in args.remove_events.split(",") if t.strip()}
+    if not (remove_ids or event_tags or even_types):
+        sys.exit("ERROR: nothing to remove (no ids or event types found).")
 
     alive, stats = prune(lines, remove_ids,
-                         prune_sources=prune_sources, prune_media=prune_media)
+                         prune_sources=prune_sources, prune_media=prune_media,
+                         remove_event_tags=event_tags, remove_even_types=even_types)
 
     print_report(stats, args.dry_run)
 

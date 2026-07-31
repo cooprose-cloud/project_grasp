@@ -46,7 +46,27 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gedcom_prune import (read_gedcom_lines, index_records, person_name,
                           source_label, media_label, is_pointer, prune,
-                          write_gedcom, require_distinct)
+                          write_gedcom, require_distinct, classify_tokens,
+                          even_type_value)
+
+# Tags that live at level 1 under INDI/FAM but are NOT events/attributes
+STRUCTURAL_TAGS = {
+    "NAME", "SEX", "OBJE", "FAMS", "FAMC", "HUSB", "WIFE", "CHIL", "CHAN",
+    "NOTE", "SOUR", "RIN", "RFN", "AFN", "RESN", "SUBM", "SUBN", "ANCI",
+    "DESI", "ALIA", "ASSO", "REFN", "_PHOTO", "_UID",
+}
+FRIENDLY_EVENTS = {
+    "BIRT": "Birth", "CHR": "Christening", "DEAT": "Death", "BURI": "Burial",
+    "CREM": "Cremation", "ADOP": "Adoption", "BAPM": "Baptism", "CONF": "Confirmation",
+    "FCOM": "First Communion", "ORDN": "Ordination", "NATU": "Naturalization",
+    "EMIG": "Emigration", "IMMI": "Immigration", "CENS": "Census", "PROB": "Probate",
+    "WILL": "Will", "GRAD": "Graduation", "RETI": "Retirement", "EVEN": "Event",
+    "EDUC": "Education", "OCCU": "Occupation", "RELI": "Religion", "RESI": "Residence",
+    "TITL": "Title", "PROP": "Property", "NATI": "Nationality", "DSCR": "Description",
+    "ANUL": "Annulment", "DIV": "Divorce", "DIVF": "Divorce Filed", "ENGA": "Engagement",
+    "MARB": "Marriage Banns", "MARC": "Marriage Contract", "MARR": "Marriage",
+    "MARL": "Marriage License", "MARS": "Marriage Settlement", "_MILT": "Military",
+}
 
 
 def event_year(lines, rec, evt):
@@ -139,6 +159,35 @@ def build_all(gedcom_path):
             if source and source in recs and recs[source]["type"] == "SOUR":
                 src_media[source].add(rest)
 
+    # Event types present under INDI/FAM (for the Event types tab)
+    tag_counts = defaultdict(int)
+    even_counts = defaultdict(int)
+    even_untyped = 0
+    cur_owner = None
+    for idx, (lv, tag, rest, _) in enumerate(lines):
+        if lv == 0:
+            cur_owner = recs.get(tag, {}).get("type") if is_pointer(tag) else None
+        elif lv == 1 and cur_owner in ("INDI", "FAM"):
+            if tag == "EVEN":
+                tv = even_type_value(lines, idx)
+                if tv:
+                    even_counts[tv] += 1
+                else:
+                    even_untyped += 1
+            elif tag not in STRUCTURAL_TAGS:
+                tag_counts[tag] += 1
+    event_types = []
+    for tag, c in tag_counts.items():
+        event_types.append({"id": f"EVENT:{tag}",
+                             "label": f"{tag} — {FRIENDLY_EVENTS.get(tag, 'event/attribute')}",
+                             "count": c})
+    for tv, c in even_counts.items():
+        event_types.append({"id": f"EVENTTYPE:{tv}", "label": f"EVEN — {tv}", "count": c})
+    if even_untyped:
+        event_types.append({"id": "EVENT:EVEN",
+                            "label": "EVEN — generic (no custom type)", "count": even_untyped})
+    event_types.sort(key=lambda r: -r["count"])
+
     def sk(p):
         parts = p["name"].split()
         return (parts[-1].lower() if parts else "", p["name"].lower())
@@ -148,7 +197,8 @@ def build_all(gedcom_path):
     return (people, sources, media,
             {k: list(v) for k, v in parents.items()},
             {k: list(v) for k, v in children.items()},
-            {k: list(v) for k, v in src_media.items()})
+            {k: list(v) for k, v in src_media.items()},
+            event_types)
 
 
 def _closure(seeds, adj):
@@ -186,9 +236,12 @@ def write_ids_file(ids_path, ids, order, label_map):
     ids = sorted(set(ids), key=lambda x: order.get(x, 1e9))
     with open(ids_path, "w", encoding="utf-8") as fh:
         fh.write("# gedcom_prune removal list — written by gedcom_select.py\n")
-        fh.write("# Individuals, sources (@S..@), and media (@M..@). Text after the ID is a note.\n")
+        fh.write("# Individuals/sources/media by @ID@; event lines like 'EVENT:RESI' / 'EVENTTYPE:Arrival'.\n")
         for i in ids:
-            fh.write(f"{i}   {label_map.get(i,'')}\n")
+            if str(i).upper().startswith("EVENT"):
+                fh.write(f"{i}\n")
+            else:
+                fh.write(f"{i}   {label_map.get(i,'')}\n")
     return ids
 
 
@@ -235,6 +288,7 @@ PAGE = r"""<!DOCTYPE html>
     <button class="tab active" data-tab="individuals" id="tab-individuals">Individuals (<span id="ci">0</span>)</button>
     <button class="tab" data-tab="sources" id="tab-sources">Sources (<span id="cs">0</span>)</button>
     <button class="tab" data-tab="media" id="tab-media">Media (<span id="cm">0</span>)</button>
+    <button class="tab" data-tab="events" id="tab-events">Event types (<span id="ce">0</span>)</button>
   </div>
   <div class="bar">
     <input id="q" placeholder="Search…" autocomplete="off">
@@ -258,12 +312,13 @@ PAGE = r"""<!DOCTYPE html>
 </table>
 </div>
 <script>
-const DATA = {individuals: __INDIV__, sources: __SOURCES__, media: __MEDIA__};
+const DATA = {individuals: __INDIV__, sources: __SOURCES__, media: __MEDIA__, events: __EVENTS__};
 const PRE = new Set(__PRESEL__);
 const selected = new Set(PRE);
 const IDSET = {ind:new Set(DATA.individuals.map(x=>x.id)),
                src:new Set(DATA.sources.map(x=>x.id)),
-               med:new Set(DATA.media.map(x=>x.id))};
+               med:new Set(DATA.media.map(x=>x.id)),
+               evt:new Set(DATA.events.map(x=>x.id))};
 let tab='individuals', sortK='name', sortDir=1, filter='';
 
 const rows=document.getElementById('rows');
@@ -277,6 +332,7 @@ function shown(){
   const list=DATA[tab]; const f=filter.trim().toLowerCase();
   let r=list.filter(x=> !f || label(x).toLowerCase().includes(f) || x.id.toLowerCase().includes(f));
   r.sort((a,b)=>{
+    if(sortK==='count') return (a.count-b.count)*sortDir;
     let ka,kb;
     if(sortK==='name'){ka=surnameKey(a);kb=surnameKey(b);}
     else{ka=(a[sortK]||'').toString().toLowerCase();kb=(b[sortK]||'').toString().toLowerCase();}
@@ -286,15 +342,17 @@ function shown(){
 }
 function headHtml(){
   if(tab==='individuals') return `<tr><th class="chk"></th><th data-k="name">Name</th><th class="id" data-k="id">ID</th><th data-k="birth">Birth</th><th data-k="death">Death</th></tr>`;
+  if(tab==='events') return `<tr><th class="chk"></th><th data-k="label">Event type</th><th data-k="count">Count</th></tr>`;
   const lab = tab==='sources' ? 'Source title' : 'Media file';
   return `<tr><th class="chk"></th><th data-k="label">${lab}</th><th class="id" data-k="id">ID</th></tr>`;
 }
 function rowHtml(x){
   const c=`<td class="chk"><input type="checkbox" ${selected.has(x.id)?'checked':''}></td>`;
   if(tab==='individuals') return c+`<td>${esc(x.name)}</td><td class="id">${x.id}</td><td class="yr">${x.birth||''}</td><td class="yr">${x.death||''}</td>`;
+  if(tab==='events') return c+`<td class="lbl">${esc(x.label)}</td><td class="yr">${x.count}</td>`;
   return c+`<td class="lbl">${esc(x.label)}</td><td class="id">${x.id}</td>`;
 }
-function counts(){let ci=0,cs=0,cm=0;for(const id of selected){if(IDSET.ind.has(id))ci++;else if(IDSET.src.has(id))cs++;else if(IDSET.med.has(id))cm++;}return{ci,cs,cm};}
+function counts(){let ci=0,cs=0,cm=0,ce=0;for(const id of selected){if(IDSET.ind.has(id))ci++;else if(IDSET.src.has(id))cs++;else if(IDSET.med.has(id))cm++;else if(IDSET.evt.has(id))ce++;}return{ci,cs,cm,ce};}
 function render(){
   thead.innerHTML=headHtml();
   thead.querySelectorAll('th[data-k]').forEach(th=>{th.onclick=()=>{const k=th.dataset.k;if(sortK===k)sortDir*=-1;else{sortK=k;sortDir=1;}render();};});
@@ -313,7 +371,8 @@ function render(){
   document.getElementById('ci').textContent=c.ci;
   document.getElementById('cs').textContent=c.cs;
   document.getElementById('cm').textContent=c.cm;
-  document.getElementById('sel').textContent=`${selected.size} selected (${c.ci} people, ${c.cs} sources, ${c.cm} media)`;
+  document.getElementById('ce').textContent=c.ce;
+  document.getElementById('sel').textContent=`${selected.size} selected (${c.ci} people, ${c.cs} sources, ${c.cm} media, ${c.ce} event types)`;
   const showKeep = tab==='individuals' ? 'inline-block':'none';
   document.getElementById('anc').style.display=showKeep;
   document.getElementById('desc').style.display=showKeep;
@@ -325,7 +384,9 @@ function esc(s){return (s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':
 q.oninput=()=>{filter=q.value;render();};
 document.querySelectorAll('.tab').forEach(t=>{
   t.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
-    t.classList.add('active'); tab=t.dataset.tab; sortK=(tab==='individuals'?'name':'label'); sortDir=1; render();};
+    t.classList.add('active'); tab=t.dataset.tab;
+    if(tab==='events'){sortK='count';sortDir=-1;}else{sortK=(tab==='individuals'?'name':'label');sortDir=1;}
+    render();};
 });
 document.getElementById('selshown').onclick=()=>{shown().forEach(x=>selected.add(x.id));render();};
 document.getElementById('invert').onclick=()=>{for(const x of DATA[tab]){selected.has(x.id)?selected.delete(x.id):selected.add(x.id);}render();};
@@ -379,7 +440,7 @@ document.getElementById('save').onclick=async()=>{
 document.getElementById('prune').onclick=async()=>{
   if(selected.size===0){banner(false,'Nothing selected to remove.');return;}
   const c=counts();
-  if(!confirm(`Remove ${c.ci} individual(s), ${c.cs} source(s), ${c.cm} media and write the trimmed GEDCOM?`))return;
+  if(!confirm(`Remove ${c.ci} individual(s), ${c.cs} source(s), ${c.cm} media, ${c.ce} event type(s) and write the trimmed GEDCOM?`))return;
   setBusy(true);
   try{
     const r=await fetch('/prune',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:[...selected]})});
@@ -394,6 +455,7 @@ document.getElementById('prune').onclick=async()=>{
       `<tr><td>Individuals removed</td><td><b>${s.individuals}</b></td></tr>`+
       `<tr><td>Sources removed (selected)</td><td>${s.sources_removed}</td></tr>`+
       `<tr><td>Media removed (selected)</td><td>${s.media_removed}</td></tr>`+
+      `<tr><td>Events removed</td><td>${s.events_removed}</td></tr>`+
       `<tr><td>Families deleted (emptied)</td><td>${s.families_deleted}</td></tr>`+
       `<tr><td>Families kept but detached</td><td>${s.families_modified}</td></tr>`+
       `<tr><td>Sources pruned (orphaned)</td><td>${s.sources_pruned}</td></tr>`+
@@ -450,6 +512,7 @@ def make_handler(cfg):
                         .replace("__INDIV__", json.dumps(cfg["people"]))
                         .replace("__SOURCES__", json.dumps(cfg["sources"]))
                         .replace("__MEDIA__", json.dumps(cfg["media"]))
+                        .replace("__EVENTS__", json.dumps(cfg["events"]))
                         .replace("__PRESEL__", json.dumps(sorted(presel))))
                 self._send(200, html)
             else:
@@ -468,15 +531,19 @@ def make_handler(cfg):
                 elif self.path == "/prune":
                     ids = self._body().get("ids", [])
                     write_ids_file(cfg["ids_path"], ids, order, label_map)
+                    rec_ids, ev_tags, ev_types = classify_tokens(ids)
                     lines = read_gedcom_lines(cfg["gedcom"])
-                    alive, stats = prune(lines, list(ids),
+                    alive, stats = prune(lines, rec_ids,
                                          prune_sources=cfg["prune_sources"],
-                                         prune_media=cfg["prune_media"])
+                                         prune_media=cfg["prune_media"],
+                                         remove_event_tags=ev_tags,
+                                         remove_even_types=ev_types)
                     write_gedcom(lines, alive, cfg["output"])
                     report = {
                         "individuals": len(stats["removed_individuals"]),
                         "sources_removed": len(stats["removed_sources"]),
                         "media_removed": len(stats["removed_media"]),
+                        "events_removed": stats["events_removed"],
                         "families_deleted": len(stats["families_deleted"]),
                         "families_modified": len(stats["families_modified"]),
                         "sources_pruned": len(stats["sources_pruned"]),
@@ -484,8 +551,9 @@ def make_handler(cfg):
                         "skipped": len(stats["missing_ids"]) + len(stats["wrong_type_ids"]),
                     }
                     print(f"  ✓ Pruned: removed {report['individuals']} individual(s), "
-                          f"{report['sources_removed']} source(s), {report['media_removed']} media "
-                          f"-> {os.path.abspath(cfg['output'])}", flush=True)
+                          f"{report['sources_removed']} source(s), {report['media_removed']} media, "
+                          f"{report['events_removed']} event(s) -> {os.path.abspath(cfg['output'])}",
+                          flush=True)
                     self._json({"ok": True, "output": os.path.abspath(cfg["output"]),
                                 "ids_path": os.path.abspath(cfg["ids_path"]),
                                 "report": report})
@@ -542,9 +610,9 @@ def main():
         args.output = root + ".trimmed" + (ext or ".ged")
     require_distinct(args.gedcom, args.output)
 
-    people, sources, media, parents, children, source_media = build_all(args.gedcom)
+    people, sources, media, parents, children, source_media, events = build_all(args.gedcom)
     cfg = {
-        "people": people, "sources": sources, "media": media,
+        "people": people, "sources": sources, "media": media, "events": events,
         "parents": parents, "children": children, "source_media": source_media,
         "ids_path": args.ids, "gedcom": args.gedcom, "output": args.output,
         "prune_sources": not (args.keep_orphans or args.keep_orphan_sources),
@@ -553,8 +621,8 @@ def main():
 
     httpd = HTTPServer(("127.0.0.1", args.port), make_handler(cfg))
     url = f"http://127.0.0.1:{args.port}/"
-    print(f"Loaded {len(people)} individuals, {len(sources)} sources, {len(media)} media "
-          f"from {args.gedcom}")
+    print(f"Loaded {len(people)} individuals, {len(sources)} sources, {len(media)} media, "
+          f"{len(events)} event types from {args.gedcom}")
     print(f"Selector running at {url}")
     print(f"  Save to ids.txt -> {os.path.abspath(args.ids)}")
     print(f"  Save & Prune    -> {os.path.abspath(args.output)}")
