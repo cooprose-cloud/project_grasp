@@ -215,20 +215,22 @@ def _closure(seeds, adj):
 
 
 def load_existing_ids(ids_path):
+    """Pre-check set from an existing list: records AND event tokens, in the
+    same id form the page uses (so all prior selections come back checked)."""
     ids = set()
     if not os.path.isfile(ids_path):
         return ids
+    tokens = []
     with open(ids_path, encoding="utf-8-sig", errors="replace") as fh:
         for raw in fh:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            token = line.replace(",", " ").split()[0]
-            if not token.startswith("@"):
-                token = "@" + token
-            if not token.endswith("@"):
-                token = token + "@"
-            ids.add(token)
+            tokens.append(line)
+    rec_ids, event_tags, even_types = classify_tokens(tokens)
+    ids.update(rec_ids)
+    ids.update(f"EVENT:{t}" for t in event_tags)
+    ids.update(f"EVENTTYPE:{v}" for v in even_types)
     return ids
 
 
